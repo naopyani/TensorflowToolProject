@@ -32,13 +32,5 @@ class Word2Vec(tf.keras.Model):
         return dots
 
 
-def train(model, data):
-    for t in range(2500):
-        bx, by = data.sample(8)
-        loss = model.step(bx, by)
-        if t % 200 == 0:
-            print("step: {} | loss: {}".format(t, loss))
-
-
 if __name__ == '__main__':
     pass
