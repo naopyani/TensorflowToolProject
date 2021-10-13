@@ -3,12 +3,18 @@
 import os
 from urllib.request import urlretrieve
 import zipfile
-import collections
 import tensorflow as tf
-import tqdm
-import re
-import string
 from tensorflow.keras.layers.experimental.preprocessing import TextVectorization
+import numpy as np
+import jieba.posseg
+import jieba.analyse
+
+
+def get_corpus(word_pre_path):
+    df = open(word_pre_path, "r", encoding='utf-8')
+    corpus = df.readlines()
+    df.close()
+    return corpus
 
 
 def download_dataset(source_url, save_path):
@@ -25,51 +31,23 @@ def get_zip_word_list(data_path):
 
 
 def get_word_list(word_pre_path):
-    df = open(word_pre_path, "r", encoding='utf-8')
-    corpus = df.readlines()
-    df.close()
+    corpus = get_corpus(word_pre_path)
     raw_word = list(map(lambda y: list(str(y).replace("\n", "").split(" ")), corpus))
     return raw_word
 
 
-def get_word_bag(word_pre_path):
-    word_bag = list()
-    df = open(word_pre_path, "r", encoding='utf-8')
-    corpus = df.readlines()
-    df.close()
-    list(map(lambda y: word_bag.extend(list(str(y).replace("\n", "").split(" "))), corpus))
+def get_int_list(word_pre_path):
+    corpus = get_corpus(word_pre_path)
+    filter_corpus = list(filter(lambda x: x != '\n', corpus))
+    raw_word = list(map(lambda y: list(map(int, str(y).replace("\n", "").split(","))), filter_corpus))
+    return raw_word
+
+
+def get_int_bag(word_pre_path):
+    corpus = get_corpus(word_pre_path)
+    filter_corpus = list(filter(lambda x: x != '\n', corpus))
+    word_bag = list(map(lambda x: int(str(x).replace("\n", "")), filter_corpus))
     return word_bag
-
-
-def build_dataset(words):
-    count = [['UNK', -1]]
-    count.extend(collections.Counter(words).most_common())
-    word2id = dict()
-    for word, _ in count:
-        word2id[word] = len(word2id)
-    data = list()
-    unk_count = 0
-    for word in words:
-        if word in word2id:
-            index = word2id[word]
-        else:
-            index = 0  # dictionary['UNK']
-            unk_count += 1
-        data.append(index)
-    count[0][1] = unk_count
-    id2word = dict(zip(word2id.values(), word2id.keys()))
-    return data, count, word2id, id2word
-
-
-def custom_standardization(input_data):
-    """
-    把传入的张量或字符串变成小写，和去掉标点符号
-    :param input_data: 张量或者字符串
-    :return:
-    """
-    lowercase = tf.strings.lower(input_data)
-    return tf.strings.regex_replace(lowercase,
-                                    '[%s]' % re.escape(string.punctuation), '')
 
 
 def text_line_object(data_path):
@@ -91,6 +69,9 @@ def get_sequences_list(text_ds, vocab_size, sequence_length, batch_size):
     :param sequence_length: 句子固定长度
     :return: 序列化后的文本list
     """
+
+    # Use the TextVectorization layer to normalize, split, and map strings to
+    # integers. Set output_sequence_length length to pad all samples to same length.
     vectorize_layer = TextVectorization(
         max_tokens=vocab_size,
         output_mode='int',
@@ -100,63 +81,50 @@ def get_sequences_list(text_ds, vocab_size, sequence_length, batch_size):
     # text向量化
     text_vector_ds = text_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE).map(vectorize_layer).unbatch()
     sequences = list(text_vector_ds.as_numpy_iterator())
-    return sequences, vectorize_layer
+    vocab = vectorize_layer.get_vocabulary()
+    print("词汇量" + str(len(vocab)))
+    return sequences, vocab
 
 
-def generate_training_data(sequences, window_size, num_ns, vocab_size, seed):
-    """
-    生成训练数据
-    :param sequences:
-    :param window_size:
-    :param num_ns:
-    :param vocab_size:
-    :param seed:
-    :return:
-    """
-    # Elements of each training example are appended to these lists.
-    targets, contexts, labels = [], [], []
+# Iterate over all sequences (sentences) in dataset.
+def map_sequences(sequence, num_ns, vocab_size, sampling_table, window_size, seed, targets_writer, contexts_writer,
+                  labels_writer):
+    # Generate positive skip-gram pairs for a sequence (sentence).
+    positive_skip_grams, _ = tf.keras.preprocessing.sequence.skipgrams(sequence, vocabulary_size=vocab_size,
+                                                                       sampling_table=sampling_table,
+                                                                       window_size=window_size, negative_samples=0)
+    positive_skip_grams_it = iter(positive_skip_grams)
 
-    # Build the sampling table for vocab_size tokens.
-    sampling_table = tf.keras.preprocessing.sequence.make_sampling_table(vocab_size)
+    # Iterate over each positive skip-gram pair to produce training examples
+    # with positive context word and negative samples.
 
-    # Iterate over all sequences (sentences) in dataset.
-    for sequence in tqdm.tqdm(sequences):
+    # del _positive_skip_grams
+    # del context
+    # del label
 
-        # Generate positive skip-gram pairs for a sequence (sentence).
-        positive_skip_grams, _ = tf.keras.preprocessing.sequence.skipgrams(
-            sequence,
-            vocabulary_size=vocab_size,
-            sampling_table=sampling_table,
-            window_size=window_size,
-            negative_samples=0)
+    for _positive_skip_grams in positive_skip_grams_it:
+        context_class = tf.expand_dims(tf.constant([_positive_skip_grams[1]], dtype="int64"), 1)
+        negative_sampling_candidates, _, _ = tf.random.log_uniform_candidate_sampler(true_classes=context_class,
+                                                                                     num_true=1, num_sampled=num_ns,
+                                                                                     unique=True,
+                                                                                     range_max=vocab_size,
+                                                                                     seed=seed,
+                                                                                     name="negative_sampling")
 
-        # Iterate over each positive skip-gram pair to produce training examples
-        # with positive context word and negative samples.
-        for target_word, context_word in positive_skip_grams:
-            context_class = tf.expand_dims(
-                tf.constant([context_word], dtype="int64"), 1)
-            negative_sampling_candidates, _, _ = tf.random.log_uniform_candidate_sampler(
-                true_classes=context_class,
-                num_true=1,
-                num_sampled=num_ns,
-                unique=True,
-                range_max=vocab_size,
-                seed=seed,
-                name="negative_sampling")
-
-            # Build context and label vectors (for one target word)
-            negative_sampling_candidates = tf.expand_dims(
-                negative_sampling_candidates, 1)
-
-            context = tf.concat([context_class, negative_sampling_candidates], 0)
-            label = tf.constant([1] + [0] * num_ns, dtype="int64")
-
-            # Append each element from the training example to global lists.
-            targets.append(target_word)
-            contexts.append(context)
-            labels.append(label)
-
-    return targets, contexts, labels
+        # Build context and label vectors (for one target word)
+        negative_sampling_candidates = tf.expand_dims(negative_sampling_candidates, 1)
+        # target = yield _positive_skip_grams[0]
+        context = tf.concat([context_class, negative_sampling_candidates], 0)
+        label = tf.constant([1] + [0] * num_ns, dtype="int64")
+        # Append each element from the training example to global lists.
+        targets_writer.writerow([_positive_skip_grams[0]])
+        contexts_writer.writerow(list(np.array(context)[:, 0]))
+        labels_writer.writerow(list(np.array(label)))
+        del _positive_skip_grams
+        del context
+        del label
+        del negative_sampling_candidates
+        del context_class
 
 
 def dataset_buffer_batch(targets, contexts, labels, buffer_size, batch_size):
@@ -165,8 +133,68 @@ def dataset_buffer_batch(targets, contexts, labels, buffer_size, batch_size):
     return dataset.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
 
 
+def txt_to_pd(txt_path, sep="|||"):
+    df = open(txt_path, "r", encoding='utf-8')
+    lines = df.readlines()
+    df.close()
+
+    def split_line(index_line):
+        if sep not in index_line[1] or len(index_line[1].strip().split(sep)) < 2:
+            lines[index_line[0]] = (index_line[0] + 1, index_line[1].strip(), "")
+        else:
+            lines[index_line[0]] = (
+                index_line[0] + 1, index_line[1].strip().split(sep)[0], index_line[1].strip().split(sep)[1])
+        return lines
+
+    list(map(split_line, enumerate(lines)))
+    return lines
+
+
+class GetNo(object):
+    def __init__(self):
+        self.key_i = 0
+
+    def get_no(self):
+        return self.key_i
+
+    def add_no(self):
+        self.key_i += 1
+        if self.key_i % 10000 == 0:
+            print(self.key_i)
+
+
+def data_pre(text, stop_word):
+    """
+    分词，去停词，词性筛选
+    :param text: 文本
+    :param stop_word: 停用词
+    :return:
+    """
+    GN = GetNo()
+    pos = ['n', 'nz', 'v', 'vd', 'vn', 'l', 'a', 'd']
+    seg = jieba.posseg.cut(text)
+
+    def word_append(x):
+        GN.add_no()
+        if x.word not in stop_word and x.flag in pos:
+            return x.word
+
+    return list(filter(None, list(map(word_append, seg))))
+
+
+def save_data_pre(data, stop_word, path="data/pre_data_pre.txt"):
+    content_list = list(map(lambda x: x[1] + x[2], data))
+
+    def key_str(x):
+        key = " ".join(data_pre(x, stop_word)) + "\n"
+        return key
+
+    corpus = list(map(key_str, content_list))
+    file = open(path, 'w', encoding='utf-8')
+
+    file.writelines(corpus)
+    file.close()
+
+
 if __name__ == '__main__':
     pass
-    # raw_word = get_word_bag("../data/XXX.txt")
-    # data, count, vocab, inverse_vocab = build_dataset(raw_word)
-    # print(data, count, vocab, inverse_vocab)
